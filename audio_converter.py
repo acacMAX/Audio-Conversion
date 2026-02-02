@@ -449,7 +449,10 @@ class AudioConverterApp:
             output_file = os.path.join(self.output_dir, input_path.stem + '.' + output_format)
             
             # 构建转换命令
-            cmd = ['ffmpeg', '-y', '-i', input_file]
+            cmd = ['ffmpeg', '-y', '-i', input_file, '-vn']  # -vn: 不处理视频流
+            
+            # 记录命令用于调试
+            self.debug_cmd = ' '.join(f'"{arg}"' if ' ' in str(arg) else str(arg) for arg in cmd)
             
             # 根据输出格式设置编码器
             quality = self.quality_var.get()
@@ -485,6 +488,9 @@ class AudioConverterApp:
                 else:
                     cmd.extend(['-b:a', '128k'])
             elif output_format == 'm4a':
+                # m4a 使用 mov 容器格式
+                cmd.extend(['-vn'])  # 不处理视频流
+                cmd.extend(['-f', 'mov'])
                 cmd.extend(['-codec:a', 'aac'])
                 if '高质量' in quality:
                     cmd.extend(['-b:a', '256k'])
@@ -511,6 +517,12 @@ class AudioConverterApp:
             
             cmd.append(output_file)
             
+            # 调试：显示完整命令
+            import shlex
+            cmd_str = ' '.join(shlex.quote(str(arg)) for arg in cmd)
+            # 在实际执行时，这个日志会被 conversion_worker 中的日志调用覆盖
+            # 所以我们只在这里记录命令，不直接输出
+            
             # 设置环境变量以包含 ffmpeg 路径
             env = os.environ.copy()
             system_path = os.environ.get('PATH', '')
@@ -530,18 +542,54 @@ class AudioConverterApp:
             
             env['PATH'] = system_path
             
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=env,
-                timeout=300  # 5分钟超时
-            )
+            # 在 Windows 上处理路径中的空格和特殊字符
+            if os.name == 'nt':
+                # Windows: 确保路径被正确处理
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    timeout=300,  # 5分钟超时
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            else:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    timeout=300  # 5分钟超时
+                )
             
             if result.returncode == 0:
                 return True, output_file  # 返回输出文件路径
             else:
-                return False, "转换失败"
+                # 将 stderr 错误信息解码并返回
+                error_msg = result.stderr.decode('utf-8', errors='ignore')
+                # 提取关键错误信息
+                if 'Invalid data' in error_msg:
+                    return False, "输入文件数据无效或损坏"
+                elif 'Permission denied' in error_msg:
+                    return False, "权限被拒绝，无法写入文件"
+                elif 'No space left' in error_msg:
+                    return False, "磁盘空间不足"
+                elif 'Error' in error_msg:
+                    # 查找包含 Error 的行
+                    for line in error_msg.split('\n'):
+                        if 'Error' in line and 'ffmpeg' not in line.lower():
+                            # 附加命令信息用于调试
+                            cmd_info = getattr(self, 'debug_cmd', '')
+                            return False, f"FFmpeg错误: {line.strip()}"
+                    # 如果没找到具体的 Error 行，返回最后一行
+                    return False, f"FFmpeg错误: {error_msg.split('\n')[-1].strip()}"
+                else:
+                    # 返回最后一行的错误信息
+                    last_line = [l for l in error_msg.split('\n') if l.strip()][-1] if error_msg else "未知错误"
+                    return False, f"转换失败: {last_line}"
                 
         except subprocess.TimeoutExpired:
             return False, "转换超时"
@@ -586,6 +634,16 @@ class AudioConverterApp:
         self.log(f"📁 输出目录: {self.output_dir}", 'info')
         self.log("="*60, 'info')
         self.status_var.set(f"准备转换 {total_files} 个文件...")
+        
+        # 检查输出目录是否可写
+        if not os.access(self.output_dir, os.W_OK):
+            self.log(f"❌ 错误: 输出目录不可写 - {self.output_dir}", 'error')
+            messagebox.showerror("错误", f"无法写入输出目录:\n{self.output_dir}\n\n请检查目录权限。")
+            self.is_converting = False
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            self.clear_btn.config(state=tk.NORMAL)
+            return
         
         for i, input_file in enumerate(self.file_list):
             if not self.is_converting:
